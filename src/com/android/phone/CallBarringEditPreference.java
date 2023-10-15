@@ -28,6 +28,9 @@ import android.os.Handler;
 import android.os.Message;
 import android.os.PersistableBundle;
 import android.telephony.CarrierConfigManager;
+import android.telephony.TelephonyManager;
+import android.telephony.ims.ImsReasonInfo;
+import android.telephony.ims.stub.ImsUtImplBase;
 import android.text.method.DigitsKeyListener;
 import android.text.method.PasswordTransformationMethod;
 import android.util.AttributeSet;
@@ -37,10 +40,34 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.codeaurora.ims.QtiImsException;
+import org.codeaurora.ims.QtiImsExtListenerBaseImpl;
+import org.codeaurora.ims.QtiImsExtConnector;
+import org.codeaurora.ims.QtiImsExtManager;
+
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BAIC;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BAICr;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BAOC;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BAOIC;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BAOICxH;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BA_ALL;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BA_MO;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BA_MT;
+import static com.android.internal.telephony.CommandsInterface.CB_FACILITY_BIC_ACR;
+
 import com.android.internal.telephony.CommandException;
+import com.android.internal.telephony.gsm.GsmMmiCode;
+import com.android.internal.telephony.gsm.SsData;
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneFactory;
 import com.android.phone.settings.fdn.EditPinPreference;
+
+import com.qti.extphone.Client;
+import com.qti.extphone.ExtPhoneCallbackListener;
+import com.qti.extphone.ExtTelephonyManager;
+import com.qti.extphone.IExtPhoneCallback;
+import com.qti.extphone.Status;
+
 
 import java.lang.ref.WeakReference;
 
@@ -54,6 +81,11 @@ public class CallBarringEditPreference extends EditPinPreference {
 
     private String mFacility;
     boolean mIsActivated = false;
+    // On IMS, network will inform as part of get_call_barring response whether
+    // pasword is required. On CS, password is always required
+    boolean mIsPasswordEnabled = true;
+    private boolean mExpectMore;
+    private ExtTelephonyManager mExtTelephonyManager;
     private CharSequence mEnableText;
     private CharSequence mDisableText;
     private CharSequence mSummaryOn;
@@ -62,7 +94,10 @@ public class CallBarringEditPreference extends EditPinPreference {
     private final MyHandler mHandler = new MyHandler(this);
     private Phone mPhone;
     private TimeConsumingPreferenceListener mTcpListener;
-
+    private Client mClient;
+    private QtiImsExtConnector mQtiImsExtConnector;
+    private QtiImsExtManager mQtiImsExtManager;
+    private SetCallBarringReqInfo mSetCallBarringReqInfo = new SetCallBarringReqInfo(false, null);
     private static final int PW_LENGTH = 4;
 
     /**
@@ -100,19 +135,201 @@ public class CallBarringEditPreference extends EditPinPreference {
         this(context, null);
     }
 
+    private QtiImsExtListenerBaseImpl imsInterfaceListener =
+            new QtiImsExtListenerBaseImpl() {
+                @Override
+                public void onUTReqFailed(int phoneId, int errCode, String errString) {
+                    if (DBG) Log.d(LOG_TAG, "onUTReqFailed phoneId=" + phoneId + " errCode= "
+                            +errCode + "errString ="+ errString);
+
+                    if (errCode == ImsReasonInfo.CODE_LOCAL_CALL_CS_RETRY_REQUIRED) {
+                        getCallBarringWithExpectMore();
+                    } else {
+                        Message msg = mHandler.obtainMessage(MyHandler.MESSAGE_GET_CALL_BARRING);
+                        AsyncResult.forMessage(msg, null, PhoneUtils.getCommandException(errCode));
+                        msg.sendToTarget();
+                    }
+                }
+
+                @Override
+                public void queryCallBarringResponse(int[] response) {
+                    Message msg = mHandler.obtainMessage(MyHandler.MESSAGE_GET_CALL_BARRING);
+                    AsyncResult.forMessage(msg, response, null);
+                    msg.sendToTarget();
+                }
+            };
+
+    private void createQtiImsExtConnector(Context context) {
+        try {
+            mQtiImsExtConnector = new QtiImsExtConnector(context,
+                    new QtiImsExtConnector.IListener() {
+                        @Override
+                        public void onConnectionAvailable(QtiImsExtManager qtiImsExtManager) {
+                            Log.i(LOG_TAG, "QtiImsExtConnector onConnectionAvailable");
+                            mQtiImsExtManager = qtiImsExtManager;
+                            queryImsCallBarringStatus();
+                        }
+                        @Override
+                        public void onConnectionUnavailable() {
+                            mQtiImsExtManager = null;
+                        }
+                    });
+        } catch (QtiImsException e) {
+            Log.e(LOG_TAG, "Unable to create QtiImsExtConnector");
+        }
+    }
+
+    public void deInit() {
+        if (mQtiImsExtConnector != null) {
+            mQtiImsExtConnector.disconnect();
+            mQtiImsExtConnector = null;
+            mQtiImsExtManager = null;
+        }
+    }
+
     void init(TimeConsumingPreferenceListener listener, boolean skipReading, Phone phone) {
         Log.d(LOG_TAG, "init: phone id = " + phone.getPhoneId());
-
         mPhone = phone;
 
         mTcpListener = listener;
+        mExtTelephonyManager = ExtTelephonyManager.getInstance(getContext());
         if (!skipReading) {
             // Query call barring status
-            mPhone.getCallBarring(mFacility, "", mHandler.obtainMessage(
-                    MyHandler.MESSAGE_GET_CALL_BARRING), getServiceClassForCallBarring(mPhone));
+            if (!mPhone.isUtEnabled()) {
+                if (mPhone.getPhoneType() == TelephonyManager.PHONE_TYPE_GSM &&
+                        PhoneUtils.isBacktoBackSSFeatureSupported()) {
+                    getCallBarringWithExpectMore();
+                } else {
+                    mPhone.getCallBarring(mFacility, "", mHandler.obtainMessage(
+                            MyHandler.MESSAGE_GET_CALL_BARRING),
+                            getServiceClassForCallBarring(mPhone));
+                }
+            } else {
+                createQtiImsExtConnector(getContext());
+                //Connect will get the QtiImsExtManager instance.
+                mQtiImsExtConnector.connect();
+            }
             if (mTcpListener != null) {
                 mTcpListener.onStarted(this, true);
             }
+        }
+    }
+
+    private boolean isCbQueryBlockedByFdn() {
+        if (mPhone == null) {
+            return false;
+        }
+        SsData.ServiceType serviceType = GsmMmiCode.cbFacilityToServiceType(mFacility);
+        return PhoneUtils.isRequestBlockedByFDN(SsData.RequestType.SS_INTERROGATION, serviceType,
+                mPhone.getPhoneId(), getContext());
+    }
+
+    private void queryImsCallBarringStatus() {
+        if (isCbQueryBlockedByFdn()) {
+            Log.d(LOG_TAG, "queryImsCallBarringStatus blocked by FDN check");
+            sendErrorResponse(CommandException.Error.FDN_CHECK_FAILURE);
+            return;
+        }
+        if (mQtiImsExtManager == null) {
+            Log.e(LOG_TAG, "IMS Service not connected");
+            sendErrorResponse();
+            return;
+        }
+        try {
+            mQtiImsExtManager.queryCallBarring(mPhone.getPhoneId(),
+                    getCBTypeFromFacility(mFacility), "", getServiceClassForCallBarring(mPhone),
+                    mExpectMore, imsInterfaceListener);
+        } catch (QtiImsException e) {
+            Log.d(LOG_TAG, "queryCallForwardStatus failed. " +
+                    "Exception = " + e);
+            sendErrorResponse();
+        }
+    }
+
+    private void sendErrorResponse() {
+        sendErrorResponse(CommandException.Error.GENERIC_FAILURE);
+    }
+
+    private void sendErrorResponse(CommandException.Error err) {
+        Message msg = mHandler.obtainMessage(MyHandler.MESSAGE_GET_CALL_BARRING);
+        AsyncResult.forMessage(msg, null, new CommandException(err));
+        msg.sendToTarget();
+    }
+
+    private int getCBTypeFromFacility(String facility) {
+        if (CB_FACILITY_BAOC.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_ALL_OUTGOING;
+        } else if (CB_FACILITY_BAOIC.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_OUTGOING_INTL;
+        } else if (CB_FACILITY_BAOICxH.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_OUTGOING_INTL_EXCL_HOME;
+        } else if (CB_FACILITY_BAIC.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_ALL_INCOMING;
+        } else if (CB_FACILITY_BAICr.equals(facility)) {
+            return ImsUtImplBase.CALL_BLOCKING_INCOMING_WHEN_ROAMING;
+        } else if (CB_FACILITY_BA_ALL.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_ALL;
+        } else if (CB_FACILITY_BA_MO.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_OUTGOING_ALL_SERVICES;
+        } else if (CB_FACILITY_BA_MT.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_INCOMING_ALL_SERVICES;
+        } else if (CB_FACILITY_BIC_ACR.equals(facility)) {
+            return ImsUtImplBase.CALL_BARRING_ANONYMOUS_INCOMING;
+        }
+
+        return 0;
+    }
+
+    private void getCallBarringWithExpectMore() {
+        if (isCbQueryBlockedByFdn()) {
+            Log.d(LOG_TAG, "getCallBarringWithExpectMore blocked by FDN check");
+            sendErrorResponse(CommandException.Error.FDN_CHECK_FAILURE);
+            return;
+        }
+
+        if (!mExtTelephonyManager.isServiceConnected()) {
+            sendErrorResponse();
+            return;
+        }
+
+        try {
+            int[] events = new int[] {};
+            mClient = mExtTelephonyManager.registerCallbackWithEvents(
+                    getContext().getPackageName(), mExtPhoneCallbackListener, events);
+            mExtTelephonyManager.getFacilityLockForApp(mPhone.getPhoneId(), mFacility,
+                    "" /*password*/, getServiceClassForCallBarring(mPhone), null /*appId*/,
+                    mExpectMore, mClient);
+        } catch (Exception e) {
+            Log.e(LOG_TAG, "Exception " + e);
+            sendErrorResponse();
+        }
+    }
+
+    private ExtPhoneCallbackListener mExtPhoneCallbackListener = new ExtPhoneCallbackListener() {
+        @Override
+        public void getFacilityLockForAppResponse(Status status, int[] response) {
+            Message msg = mHandler.obtainMessage(MyHandler.MESSAGE_GET_CALL_BARRING);
+            if (status.get() == Status.SUCCESS) {
+                AsyncResult.forMessage(msg, response, null);
+            } else {
+                AsyncResult.forMessage(msg, response,
+                        new CommandException(CommandException.Error.GENERIC_FAILURE));
+            }
+            msg.sendToTarget();
+        }
+    };
+
+    void setExpectMore(boolean expectMore) {
+        mExpectMore = expectMore;
+    }
+
+    private void setCallBarringInternal(String password) {
+        // Send set call barring message to RIL layer.
+        mPhone.setCallBarring(mFacility, !mIsActivated, password,
+                mHandler.obtainMessage(MyHandler.MESSAGE_SET_CALL_BARRING),
+                getServiceClassForCallBarring(mPhone));
+        if (mTcpListener != null) {
+            mTcpListener.onStarted(this, false);
         }
     }
 
@@ -124,6 +341,10 @@ public class CallBarringEditPreference extends EditPinPreference {
 
     @Override
     protected void showDialog(Bundle state) {
+        if (!isPasswordEnabled()) {
+            setCallBarringInternal("");
+            return;
+        }
         setDialogMessage(getContext().getString(R.string.messageCallBarring));
         super.showDialog(state);
     }
@@ -198,20 +419,22 @@ public class CallBarringEditPreference extends EditPinPreference {
             }
 
             Log.d(LOG_TAG, "onDialogClosed");
-
-            // Send set call barring message to RIL layer.
-            mPhone.setCallBarring(mFacility, !mIsActivated, password,
-                    mHandler.obtainMessage(MyHandler.MESSAGE_SET_CALL_BARRING),
-                    getServiceClassForCallBarring(mPhone));
-            if (mTcpListener != null) {
-                mTcpListener.onStarted(this, false);
-            }
+            setCallBarringInternal(password);
         }
     }
 
-    void handleCallBarringResult(boolean status) {
+    void handleCallBarringResult(boolean status, boolean password) {
         mIsActivated = status;
-        Log.i(LOG_TAG, "handleCallBarringResult: mIsActivated=" + mIsActivated);
+        mIsPasswordEnabled = password;
+        if (mTcpListener instanceof GsmUmtsCallBarringOptions) {
+            ((GsmUmtsCallBarringOptions)mTcpListener).setChangePasswordPreference(password);
+        }
+        Log.i(LOG_TAG, "handleCallBarringResult: mIsActivated=" + mIsActivated +
+                " mIsPasswordEnabled=" + mIsPasswordEnabled);
+    }
+
+    boolean isPasswordEnabled() {
+        return mIsPasswordEnabled;
     }
 
     private static int getServiceClassForCallBarring(Phone phone) {
@@ -276,7 +499,11 @@ public class CallBarringEditPreference extends EditPinPreference {
 
             AsyncResult ar = (AsyncResult) msg.obj;
 
-            if (msg.arg2 == MESSAGE_SET_CALL_BARRING) {
+            if (msg.arg2 == MESSAGE_SET_CALL_BARRING ||
+                    pref.mSetCallBarringReqInfo.mIsRequestOverIms) {
+                // This block is triggered when GET_CALL_BARRING request that caused this response
+                // is because of the user setting call barring option on UI
+                pref.mSetCallBarringReqInfo.mIsRequestOverIms = false;
                 pref.mTcpListener.onFinished(pref, false);
             } else {
                 pref.mTcpListener.onFinished(pref, true);
@@ -287,7 +514,9 @@ public class CallBarringEditPreference extends EditPinPreference {
                 Log.i(LOG_TAG, "handleGetCallBarringResponse: ar.exception=" + ar.exception);
                 pref.mTcpListener.onException(pref, (CommandException) ar.exception);
             } else {
-                if (ar.userObj instanceof Throwable) {
+                if (pref.mSetCallBarringReqInfo.mException != null ||
+                        ar.userObj instanceof Throwable) {
+                    pref.mSetCallBarringReqInfo.mException = null;
                     pref.mTcpListener.onError(pref, RESPONSE_ERROR);
                 }
                 int[] ints = (int[]) ar.result;
@@ -296,7 +525,13 @@ public class CallBarringEditPreference extends EditPinPreference {
                     pref.setEnabled(false);
                     pref.mTcpListener.onError(pref, RESPONSE_ERROR);
                 } else {
-                    pref.handleCallBarringResult(ints[0] != 0);
+                    // The getCallBarring response may be an array of size 1 or 2. ints[0] always
+                    // contains the enabled status of the call barring request
+                    // [0:deactivated, 1:activated]. If size is 2, the value of ints[1] tells
+                    // whether the underlying IMS network requires password to be sent as part
+                    // of setCallBarring requests [0: password not required, 1: password required]
+                    pref.handleCallBarringResult(ints[0] != 0,
+                            ints.length > 1 ? ints[1] != 0 : true);
                     Log.i(LOG_TAG,
                             "handleGetCallBarringResponse: CB state successfully queried: "
                                     + ints[0]);
@@ -319,11 +554,29 @@ public class CallBarringEditPreference extends EditPinPreference {
                 Log.i(LOG_TAG, "handleSetCallBarringResponse: ar.exception=" + ar.exception);
             }
             Log.i(LOG_TAG, "handleSetCallBarringResponse: re-get call barring option");
-            pref.mPhone.getCallBarring(
-                    pref.mFacility,
-                    "",
-                    obtainMessage(MESSAGE_GET_CALL_BARRING, 0, MESSAGE_SET_CALL_BARRING,
-                            ar.exception), getServiceClassForCallBarring(pref.mPhone));
+            if (!pref.mPhone.isUtEnabled()) {
+                pref.mPhone.getCallBarring(
+                        pref.mFacility,
+                        "",
+                        obtainMessage(MESSAGE_GET_CALL_BARRING, 0, MESSAGE_SET_CALL_BARRING,
+                                ar.exception), getServiceClassForCallBarring(pref.mPhone));
+            } else {
+                pref.mSetCallBarringReqInfo.mIsRequestOverIms = true;
+                pref.mSetCallBarringReqInfo.mException = ar.exception;
+                pref.queryImsCallBarringStatus();
+            }
+        }
+    }
+
+    private class SetCallBarringReqInfo{
+        // Flag determines whether set call barring request was sent over IMS
+        private boolean mIsRequestOverIms;
+        // Exception occurred in setting call barring
+        private Throwable mException;
+
+        private SetCallBarringReqInfo(boolean isRequestOverIms, Throwable exception) {
+            mIsRequestOverIms = isRequestOverIms;
+            mException = exception;
         }
     }
 }

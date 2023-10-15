@@ -42,6 +42,7 @@ import android.preference.PreferenceManager;
 import android.provider.Settings;
 import android.sysprop.TelephonyProperties;
 import android.telecom.TelecomManager;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.AnomalyReporter;
 import android.telephony.CarrierConfigManager;
 import android.telephony.ServiceState;
@@ -82,6 +83,8 @@ import com.android.phone.settings.SettingsConstants;
 import com.android.phone.vvm.CarrierVvmPackageInstalledReceiver;
 import com.android.services.telephony.domainselection.TelephonyDomainSelectionService;
 import com.android.services.telephony.rcs.TelephonyRcsService;
+
+import com.qti.extphone.ExtTelephonyManager;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
@@ -129,6 +132,7 @@ public class PhoneGlobals extends ContextWrapper {
     private static final int EVENT_MOBILE_DATA_SETTINGS_CHANGED = 16;
     private static final int EVENT_CARRIER_CONFIG_CHANGED = 17;
     private static final int EVENT_MULTI_SIM_CONFIG_CHANGED = 18;
+    private static final int EVENT_DATA_CONNECTION_ATTACHED = 19;
 
     // The MMI codes are also used by the InCallScreen.
     public static final int MMI_INITIATE = 51;
@@ -152,6 +156,7 @@ public class PhoneGlobals extends ContextWrapper {
         FULL
     }
 
+    private static final String NETWORK_ACCESS_MODE = "access_mode";
     private static PhoneGlobals sMe;
 
     CallManager mCM;
@@ -166,6 +171,7 @@ public class PhoneGlobals extends ContextWrapper {
     TelephonyDomainSelectionService mDomainSelectionService;
 
     private Phone phoneInEcm;
+    private Phone phoneInScbm;
 
     static boolean sVoiceCapable = true;
 
@@ -311,7 +317,6 @@ public class PhoneGlobals extends ContextWrapper {
                     Phone phone = (Phone) ((AsyncResult) msg.obj).userObj;
                     handleSimLock(subType, phone);
                     break;
-
                 case EVENT_DATA_ROAMING_DISCONNECTED:
                     notificationMgr.showDataRoamingNotification(msg.arg1, false);
                     break;
@@ -569,6 +574,7 @@ public class PhoneGlobals extends ContextWrapper {
                     new IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED);
             intentFilter.addAction(TelephonyIntents.ACTION_SIM_STATE_CHANGED);
             intentFilter.addAction(TelephonyIntents.ACTION_RADIO_TECHNOLOGY_CHANGED);
+            intentFilter.addAction(SmsCallbackModeService.ACTION_SMS_CALLBACK_MODE_CHANGED);
             intentFilter.addAction(TelephonyIntents.ACTION_EMERGENCY_CALLBACK_MODE_CHANGED);
             intentFilter.addAction(TelephonyIntents.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED);
             intentFilter.addAction(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED);
@@ -617,6 +623,8 @@ public class PhoneGlobals extends ContextWrapper {
             new BinderCallsStats(
                     new BinderCallsStats.Injector(),
                     com.android.internal.os.BinderLatencyProto.Dims.TELEPHONY));
+
+        PhoneUtils.connectExtTelephonyManager(this);
     }
 
     /**
@@ -657,6 +665,7 @@ public class PhoneGlobals extends ContextWrapper {
 
     private void registerSettingsObserver() {
         mSettingsObserver.unobserve();
+        ContentResolver cr = getContentResolver();
         String dataRoamingSetting = Settings.Global.DATA_ROAMING;
         String mobileDataSetting = Settings.Global.MOBILE_DATA;
         if (TelephonyManager.getDefault().getSimCount() > 1) {
@@ -828,6 +837,9 @@ public class PhoneGlobals extends ContextWrapper {
                 // re-register as it may be a new IccCard
                 int phoneId = intent.getIntExtra(PhoneConstants.PHONE_KEY,
                         SubscriptionManager.INVALID_PHONE_INDEX);
+                int subId = intent.getIntExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX,
+                        SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+                String simStatus = intent.getStringExtra(IccCardConstants.INTENT_KEY_ICC_STATE);
                 if (SubscriptionManager.isValidPhoneId(phoneId)) {
                     PhoneUtils.unregisterIccStatus(mHandler, phoneId);
                     PhoneUtils.registerIccStatus(mHandler, EVENT_SIM_NETWORK_LOCKED, phoneId);
@@ -835,6 +847,17 @@ public class PhoneGlobals extends ContextWrapper {
                 String iccStatus = intent.getStringExtra(IccCardConstants.INTENT_KEY_ICC_STATE);
                 mHandler.sendMessage(mHandler.obtainMessage(EVENT_SIM_STATE_CHANGED,
                         new EventSimStateChangedBag(phoneId, iccStatus)));
+                Phone phone = PhoneFactory.getPhone(phoneId);
+                if (phone != null) {
+                    if (IccCardConstants.INTENT_VALUE_ICC_LOADED.equals(simStatus)) {
+                        phone.getServiceStateTracker().registerForDataConnectionAttached(
+                                AccessNetworkConstants.TRANSPORT_TYPE_WWAN, mHandler, EVENT_DATA_CONNECTION_ATTACHED, subId);
+                    } else if (IccCardConstants.INTENT_VALUE_ICC_ABSENT.equals(simStatus)
+                            || IccCardConstants.INTENT_VALUE_ICC_CARD_IO_ERROR.equals(simStatus)) {
+                        phone.getServiceStateTracker()
+                                .unregisterForDataConnectionAttached(AccessNetworkConstants.TRANSPORT_TYPE_WWAN, mHandler);
+                    }
+                }
             } else if (action.equals(TelephonyIntents.ACTION_RADIO_TECHNOLOGY_CHANGED)) {
                 String newPhone = intent.getStringExtra(PhoneConstants.PHONE_NAME_KEY);
                 Log.d(LOG_TAG, "Radio technology switched. Now " + newPhone + " is active.");
@@ -864,6 +887,21 @@ public class PhoneGlobals extends ContextWrapper {
                 } else {
                     Log.w(LOG_TAG, "phoneInEcm is null.");
                 }
+            } else if (action.equals(SmsCallbackModeService.ACTION_SMS_CALLBACK_MODE_CHANGED)) {
+                int phoneId = intent.getIntExtra(PhoneConstants.PHONE_KEY, 0);
+                Log.d(LOG_TAG, "SMS Callback Mode. phoneId:" + phoneId);
+                phoneInScbm = PhoneFactory.getPhone(phoneId);
+                if (phoneInScbm != null) {
+                    if (intent.getBooleanExtra(
+                                    SmsCallbackModeService.EXTRA_PHONE_IN_SCM_STATE, false)) {
+                       // Start Sms Callback Mode service
+                        context.startService(new Intent(context, SmsCallbackModeService.class));
+                    } else {
+                        phoneInScbm = null;
+                    }
+                } else {
+                    Log.w(LOG_TAG, "phoneInScbm is null.");
+                }
             } else if (action.equals(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED)) {
                 // Roaming status could be overridden by carrier config, so we need to update it.
                 if (VDBG) Log.v(LOG_TAG, "carrier config changed.");
@@ -890,7 +928,7 @@ public class PhoneGlobals extends ContextWrapper {
 
     private void handleServiceStateChanged(ServiceState serviceState, int subId) {
         if (VDBG) Log.v(LOG_TAG, "handleServiceStateChanged");
-        int state = serviceState.getState();
+        int state = getRegistrationState(serviceState, subId);
         notificationMgr.updateNetworkSelection(state, subId);
 
         if (VDBG) {
@@ -900,6 +938,17 @@ public class PhoneGlobals extends ContextWrapper {
         if (subId == mDefaultDataSubId) {
             updateDataRoamingStatus(serviceState.getOperatorNumeric());
         }
+    }
+
+    private int getRegistrationState(ServiceState serviceState, int subId) {
+        int state = serviceState.getState();
+        int accessMode = Settings.Global.getInt(getContentResolver(),
+                NETWORK_ACCESS_MODE + SubscriptionManager.getSlotIndex(subId),
+                ExtTelephonyManager.ACCESS_MODE_PLMN);
+        if (accessMode == ExtTelephonyManager.ACCESS_MODE_SNPN) {
+            state = serviceState.getDataRegState();
+        }
+        return state;
     }
 
     /**
@@ -1035,6 +1084,10 @@ public class PhoneGlobals extends ContextWrapper {
         return phoneInEcm;
     }
 
+    public Phone getPhoneInEmergencyMode() {
+        return phoneInEcm != null ? phoneInEcm: phoneInScbm;
+    }
+
     /**
      * Triggers a refresh of the message waiting (voicemail) indicator.
      *
@@ -1052,7 +1105,8 @@ public class PhoneGlobals extends ContextWrapper {
     public void onNetworkSelectionChanged(int subId) {
         Phone phone = getPhone(subId);
         if (phone != null) {
-            notificationMgr.updateNetworkSelection(phone.getServiceState().getState(), subId);
+            int state = getRegistrationState(phone.getServiceState(), subId);
+            notificationMgr.updateNetworkSelection(state, subId);
         } else {
             Log.w(LOG_TAG, "onNetworkSelectionChanged on null phone, subId: " + subId);
         }

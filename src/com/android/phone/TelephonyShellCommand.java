@@ -40,6 +40,7 @@ import android.telephony.TelephonyManager;
 import android.telephony.TelephonyRegistryManager;
 import android.telephony.emergency.EmergencyNumber;
 import android.telephony.ims.ImsException;
+import android.telephony.ims.ImsMmTelManager;
 import android.telephony.ims.RcsContactUceCapability;
 import android.telephony.ims.feature.ImsFeature;
 import android.text.TextUtils;
@@ -96,6 +97,7 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
     private static final String UNATTENDED_REBOOT = "unattended-reboot";
     private static final String CARRIER_CONFIG_SUBCOMMAND = "cc";
     private static final String DATA_TEST_MODE = "data";
+    private static final String BACKUP_CALLING = "ciwlan";
     private static final String ENABLE = "enable";
     private static final String DISABLE = "disable";
     private static final String QUERY = "query";
@@ -329,6 +331,8 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
             }
             case DATA_TEST_MODE:
                 return handleDataTestModeCommand();
+            case BACKUP_CALLING:
+                return handleBackupCallingCommand();
             case END_BLOCK_SUPPRESSION:
                 return handleEndBlockSuppressionCommand();
             case EUICC_SUBCOMMAND:
@@ -584,6 +588,14 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
         pw.println("Mobile Data Test Mode Commands:");
         pw.println("  data enable: enable mobile data connectivity");
         pw.println("  data disable: disable mobile data connectivity");
+    }
+
+    private void onHelpBackupCalling() {
+        PrintWriter pw = getOutPrintWriter();
+        pw.println("Backup calling commands:");
+        pw.println("  enable/disable [-s SLOT_ID]: enable/disable backup calling");
+        pw.println("  -s: the slotId to perform the action on. If not provided, the slotId of the"
+                + " DDS will be used.");
     }
 
     private void onHelpEmergencyNumber() {
@@ -854,6 +866,42 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
                 break;
         }
         return 0;
+    }
+
+    private int handleBackupCallingCommand() {
+        PrintWriter errPw = getErrPrintWriter();
+        String actionArg = getNextArgRequired();
+        switch (actionArg) {
+            case ENABLE: {
+                return toggleBackupCalling(true);
+            }
+            case DISABLE: {
+                return toggleBackupCalling(false);
+            }
+            default:
+                onHelpBackupCalling();
+                break;
+        }
+        return 0;
+    }
+
+    private int toggleBackupCalling(boolean enable) {
+        int subId = getDataSubscriptionOrDefault(BACKUP_CALLING);
+        ImsMmTelManager imsMmTelMgr = getImsMmTelManager(subId);
+        if (imsMmTelMgr == null) {
+            return -1;
+        }
+        try {
+            imsMmTelMgr.setCrossSimCallingEnabled(enable);
+        } catch (ImsException ex) {
+            Log.e(LOG_TAG, "Failed to toggle backup calling", ex);
+            return -1;
+        }
+        return 0;
+    }
+
+    private ImsMmTelManager getImsMmTelManager(int subId) {
+        return ImsMmTelManager.createForSubscriptionId(subId);
     }
 
     private int handleEmergencyCallbackModeCommand() {
@@ -1529,6 +1577,22 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
             slotId = DEFAULT_PHONE_ID;
         }
         return slotId;
+    }
+
+    private int getDataSubscriptionOrDefault(String cmd) {
+        int dds = SubscriptionManager.getDefaultDataSubscriptionId();
+        String opt = getNextOption();
+        if (opt != null && opt.equals("-s")) {
+            try {
+                int slotId = Integer.parseInt(getNextArgRequired());
+                return SubscriptionManager.getSubscriptionId(slotId);
+            } catch (NumberFormatException e) {
+                getErrPrintWriter().println(cmd + " requires an integer as a SLOT_ID.");
+                return SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            }
+        } else {
+            return dds;
+        }
     }
 
     // Parse options related to Carrier Config Commands.

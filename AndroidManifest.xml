@@ -26,6 +26,26 @@
     <protected-broadcast android:name="com.android.phone.slice.action.SLICE_PURCHASE_APP_RESPONSE_TIMEOUT" />
 
     <original-package android:name="com.android.phone" />
+
+    <protected-broadcast android:name= "org.codeaurora.intent.action.SUBSCRIPTION_INFO_RECORD_ADDED" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.PRIMARY_CARD_CHANGED_IN_SERVICE" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.ACTION_SET_PRIMARY_CARD_DONE" />
+    <protected-broadcast android:name= "codeaurora.intent.action.ACTION_LTE_CONFIGURE" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.ACTION_UICC_MANUAL_PROVISION_STATUS_CHANGED" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.ACTION_RADIO_CAPABILITY_UPDATED" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.ACTION_NETWORK_SPECIFIER_SET" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.ACTION_DDS_SWITCH_DONE" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.RADIO_POWER_STATE" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.SMS_CALLBACK_MODE_CHANGED" />
+    <protected-broadcast android:name= "org.codeaurora.intent.action.SHOW_NOTICE_SCM_BLOCK_OTHERS" />
+    <protected-broadcast android:name= "org.codeaurora.telephony.VOWIFI_ENABLED" />
+    <!-- Intent sent to notify clients that the voice capability has changed and the property
+         has been modified -->
+    <protected-broadcast android:name=
+            "org.codeaurora.intent.action.MSIM_VOICE_CAPABILITY_CHANGED" />
+
+    <protected-broadcast android:name = "org.codeaurora.intent.action.ESSENTIAL_RECORDS_LOADED" />
+
     <!-- Allows granting runtime permissions to telephony related components. -->
     <uses-permission android:name="android.permission.GRANT_RUNTIME_PERMISSIONS_TO_TELEPHONY_DEFAULTS" />
 
@@ -158,9 +178,6 @@
     <uses-permission android:name="android.permission.ACCESS_TELEPHONY_SIMINFO_DB"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Needed to block unwanted malicious pop up overlays -->
-    <uses-permission android:name="android.permission.HIDE_NON_SYSTEM_OVERLAY_WINDOWS"/>
-
     <!-- Needed to set user association to a certain sim -->
     <uses-permission android:name="android.permission.MANAGE_SUBSCRIPTION_USER_ASSOCIATION"/>
 
@@ -170,6 +187,28 @@
     <permission android:name="com.android.phone.permission.ACCESS_LAST_KNOWN_CELL_ID"
                 android:label="Access last known cell identity."
                 android:protectionLevel="signature"/>
+
+    <uses-permission android:name="com.qti.permission.BIND_QTI_IMS_SERVICE" />
+    <uses-permission android:name="com.qualcomm.qti.permission.USE_EXT_TELEPHONY_SERVICE" />
+    <uses-permission android:name="com.qti.permission.RECEIVE_SMS_CALLBACK_MODE" />
+    <!-- Allows us to know if concurrent calls on both subs are possible by handling broadcast
+         intent "org.codeaurora.intent.action.MSIM_VOICE_CAPABILITY".-->
+    <uses-permission android:name="com.qti.permission.RECEIVE_MSIM_VOICE_CAPABILITY" />
+    <!-- Permission needed to handle receiving
+         intent "org.codeaurora.intent.action.MSIM_VOICE_CAPABILITY_CHANGED".-->
+    <uses-permission android:name="com.qti.permission.RECEIVE_MSIM_VOICE_CAPABILITY_CHANGED" />
+
+    <!-- Permission needed to handle intent
+         "org.codeaurora.intent.action.ESSENTIAL_RECORDS_LOADED" -->
+    <uses-permission android:name="com.qti.permission.RECEIVE_ESSENTIAL_RECORDS_LOADED" />
+
+    <permission android:name="com.qti.permission.RECEIVE_MSIM_VOICE_CAPABILITY_CHANGED"
+        android:label="Broadcast multi_sim_voice_capability property has changed"
+        android:protectionLevel="signature|system"/>
+
+    <permission android:name="com.qti.permission.RECEIVE_ESSENTIAL_RECORDS_LOADED"
+        android:label="Broadcast essential records loaded"
+        android:protectionLevel="signature|system"/>
 
     <application android:name="PhoneApp"
             android:persistent="true"
@@ -316,6 +355,16 @@
             </intent-filter>
         </activity>
 
+        <activity android:name="CallForwardType"
+                android:exported="true"
+                android:label="@string/call_forward_option"
+                android:configChanges="orientation|screenSize|keyboardHidden"
+                android:theme="@style/DialerSettingsLight">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+
         <!-- fdn setting -->
         <activity android:name="com.android.phone.settings.fdn.FdnSetting"
                 android:label="@string/fdn"
@@ -407,6 +456,9 @@
 
         <!-- CDMA Emergency Callback Mode -->
         <service android:name="EmergencyCallbackModeService">
+        </service>
+
+        <service android:name="SmsCallbackModeService">
         </service>
 
         <!-- service to dump telephony information -->
@@ -505,6 +557,18 @@
             </intent-filter>
         </activity>
 
+        <activity android:name="SmsCallbackModeExitDialog"
+            android:excludeFromRecents="true"
+            android:label="@string/scm_exit_dialog"
+            android:launchMode="singleTop"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="org.codeaurora.intent.action.ACTION_SHOW_SCM_EXIT_DIALOG" />
+                <action android:name="org.codeaurora.intent.action.SHOW_NOTICE_SCM_BLOCK_OTHERS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
         <activity android:name="MMIDialogActivity"
                 android:configChanges="orientation|screenSize|keyboardHidden"
                 android:excludeFromRecents="true"
@@ -637,5 +701,8 @@
             android:multiprocess="false"
             android:singleUser="true"
             android:writePermission="android.permission.MODIFY_PHONE_STATE"/>
+
+        <uses-library android:name="ims-ext-common"/>
+        <uses-library android:name="com.qti.extphone.extphonelib"/>
     </application>
 </manifest>

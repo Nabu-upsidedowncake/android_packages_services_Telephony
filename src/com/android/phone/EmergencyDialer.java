@@ -26,6 +26,7 @@ import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.WallpaperColors;
 import android.app.WallpaperManager;
+import android.app.StatusBarManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -174,6 +175,7 @@ public class EmergencyDialer extends Activity implements View.OnClickListener,
     private boolean mDTMFToneEnabled;
 
     private EmergencyInfoGroup mEmergencyInfoInDialpad;
+    private StatusBarManager mStatusBarManager;
     private EmergencyInfoGroup mEmergencyInfoInShortcut;
 
     // close activity when screen turns off
@@ -280,6 +282,7 @@ public class EmergencyDialer extends Activity implements View.OnClickListener,
         }
 
         setContentView(R.layout.emergency_dialer);
+        mStatusBarManager = (StatusBarManager) getSystemService(Context.STATUS_BAR_SERVICE);
 
         mDigits = (ResizingTextEditText) findViewById(R.id.digits);
         mDigits.setKeyListener(DialerKeyListener.getInstance());
@@ -636,6 +639,10 @@ public class EmergencyDialer extends Activity implements View.OnClickListener,
     protected void onResume() {
         super.onResume();
 
+        if (null != mStatusBarManager) {
+            mStatusBarManager.disable(
+                     StatusBarManager.DISABLE_RECENT|StatusBarManager.DISABLE_HOME);
+        }
         // retrieve the DTMF tone play back setting.
         mDTMFToneEnabled = Settings.System.getInt(getContentResolver(),
                 Settings.System.DTMF_TONE_WHEN_DIALING, 1) == 1;
@@ -660,6 +667,9 @@ public class EmergencyDialer extends Activity implements View.OnClickListener,
     @Override
     public void onPause() {
         super.onPause();
+        if (null != mStatusBarManager) {
+            mStatusBarManager.disable(StatusBarManager.DISABLE_NONE);
+        }
     }
 
     @Override

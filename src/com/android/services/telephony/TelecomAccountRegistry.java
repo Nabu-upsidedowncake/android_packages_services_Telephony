@@ -36,6 +36,7 @@ import android.os.Handler;
 import android.os.HandlerExecutor;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Message;
 import android.os.PersistableBundle;
 import android.os.UserHandle;
 import android.provider.Settings;
@@ -59,10 +60,15 @@ import android.telephony.ims.feature.MmTelFeature;
 import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.text.TextUtils;
 
+import com.android.ims.FeatureConnector;
 import com.android.ims.ImsManager;
 import com.android.internal.telephony.ExponentialBackoff;
 import com.android.internal.telephony.Phone;
+import com.android.internal.telephony.PhoneConfigurationManager;
+import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.PhoneFactory;
+import com.android.internal.telephony.RIL;
+import com.android.internal.telephony.util.QtiImsUtils;
 import com.android.internal.telephony.subscription.SubscriptionManagerService;
 import com.android.phone.PhoneGlobals;
 import com.android.phone.PhoneUtils;
@@ -70,9 +76,11 @@ import com.android.phone.R;
 import com.android.telephony.Rlog;
 
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Predicate;
 
@@ -118,10 +126,27 @@ public class TelecomAccountRegistry {
 
     private Handler mHandler;
 
+    // Flag which decides whether SIM should power down due to APM,
+    private static final String APM_SIM_NOT_PWDN_PROPERTY = "persist.vendor.radio.apm_sim_not_pwdn";
+
+    /**
+    * Rtt downgrade supported key to fetch the current status of carrier or the stored cache of
+    * previous sim
+    */
+    private static final String RTT_DOWNGRADE_SUPPORTED =
+            "simless_rtt_downgrade_supported";
+
+    private static final int RTT_DOWNGRADE_NOT_SUPPORTED = 0;
+
+    private enum Count {
+        ZERO,
+        ONE,
+        TWO
+    }
+
     final class AccountEntry implements PstnPhoneCapabilitiesNotifier.Listener {
         private final Phone mPhone;
         private PhoneAccount mAccount;
-        private final PstnIncomingCallNotifier mIncomingCallNotifier;
         private final PstnPhoneCapabilitiesNotifier mPhoneCapabilitiesNotifier;
         private boolean mIsEmergency;
         private boolean mIsRttCapable;
@@ -143,6 +168,8 @@ public class TelecomAccountRegistry {
         private boolean mIsManageImsConferenceCallSupported;
         private boolean mIsUsingSimCallManager;
         private boolean mIsShowPreciseFailedCause;
+        private final FeatureConnector<ImsManager> mImsManagerConnector;
+        private int mSubId;
 
         AccountEntry(Phone phone, boolean isEmergency, boolean isTest) {
             mPhone = phone;
@@ -150,11 +177,23 @@ public class TelecomAccountRegistry {
             mIsTestAccount = isTest;
             mIsAdhocConfCapable = mPhone.isImsRegistered();
             mAccount = registerPstnPhoneAccount(isEmergency, isTest);
-            Log.i(this, "Registered phoneAccount: %s with handle: %s",
-                    mAccount, mAccount.getAccountHandle());
-            mIncomingCallNotifier = new PstnIncomingCallNotifier((Phone) mPhone);
+            mSubId = getSubId();
+            Log.i(this, "Registered phoneAccount: %s with handle: %s, subId: %d",
+                    mAccount, mAccount.getAccountHandle(), mSubId);
             mPhoneCapabilitiesNotifier = new PstnPhoneCapabilitiesNotifier((Phone) mPhone,
                     this);
+            mImsManagerConnector = ImsManager.getConnector(
+                mPhone.getContext(), mPhone.getPhoneId(), "TelecomAccountRegistry",
+                new FeatureConnector.Listener<ImsManager>() {
+                    @Override
+                    public void connectionReady(ImsManager manager, int subId){
+                        registerImsRegistrationCallback();
+                    }
+                    @Override
+                    public void connectionUnavailable(int reason) {
+                        unregisterImsRegistrationCallback();
+                    }
+                }, mPhone.getContext().getMainExecutor());
 
             if (mIsTestAccount || isEmergency) {
                 // For test and emergency entries, there is no sub ID that can be assigned, so do
@@ -200,21 +239,19 @@ public class TelecomAccountRegistry {
                     updateAdhocConfCapability(false);
                 }
             };
-            registerImsRegistrationCallback();
+            mImsManagerConnector.connect();
         }
 
         void teardown() {
-            mIncomingCallNotifier.teardown();
             mPhoneCapabilitiesNotifier.teardown();
-            if (mMmTelManager != null) {
-                if (mMmtelCapabilityCallback != null) {
-                    mMmTelManager.unregisterMmTelCapabilityCallback(mMmtelCapabilityCallback);
-                }
-
-                if (mImsRegistrationCallback != null) {
-                    mMmTelManager.unregisterImsRegistrationCallback(mImsRegistrationCallback);
-                }
+            if (mMmTelManager != null && mMmtelCapabilityCallback != null) {
+                mMmTelManager.unregisterMmTelCapabilityCallback(mMmtelCapabilityCallback);
             }
+            mImsManagerConnector.disconnect();
+        }
+
+        private boolean isSameSubId(SubscriptionInfo subInfo) {
+            return mSubId == subInfo.getSubscriptionId();
         }
 
         private void registerMmTelCapabilityCallback() {
@@ -246,6 +283,7 @@ public class TelecomAccountRegistry {
             try {
                 mMmTelManager.registerImsRegistrationCallback(mContext.getMainExecutor(),
                         mImsRegistrationCallback);
+                Log.v(this, "registerImsRegistrationCallback: registration success");
             } catch (ImsException e) {
                 Log.w(this, "registerImsRegistrationCallback: registration failed, no ImsService"
                         + " available. Exception: " + e.getMessage());
@@ -255,6 +293,21 @@ public class TelecomAccountRegistry {
                         + " subscription, Exception" + e.getMessage());
                 return;
             }
+        }
+
+        private void unregisterImsRegistrationCallback() {
+            if (mMmTelManager == null || mImsRegistrationCallback == null) {
+                return;
+            }
+            mMmTelManager.unregisterImsRegistrationCallback(mImsRegistrationCallback);
+        }
+
+        // UserHandle associated with a subiscription can change after PhoneAccount was created.
+        // Check if the account is having same UserHandle as the sub.
+        private boolean isSameUserHandle() {
+            UserHandle accountUserHandle = (getPhoneAccountHandle() != null) ?
+                    getPhoneAccountHandle().getUserHandle() : null;
+            return Objects.equals(accountUserHandle, mPhone.getUserHandle());
         }
 
         /**
@@ -385,6 +438,10 @@ public class TelecomAccountRegistry {
                 mIsRttCapable = true;
             } else {
                 mIsRttCapable = false;
+            }
+
+            if (isRttDowngradeSupported()) {
+                capabilities |= PhoneAccount.CAPABILITY_DOWNGRADE_RTT;
             }
 
             if (mIsCallComposerCapable) {
@@ -810,7 +867,6 @@ public class TelecomAccountRegistry {
          */
         @Override
         public void onVideoCapabilitiesChanged(boolean isVideoCapable) {
-            mIsVideoCapable = isVideoCapable;
             synchronized (mAccountsLock) {
                 if (!mAccounts.contains(this)) {
                     // Account has already been torn down, don't try to register it again.
@@ -819,7 +875,10 @@ public class TelecomAccountRegistry {
                     // time we get here, the original phone account could have been torn down.
                     return;
                 }
-                mAccount = registerPstnPhoneAccount(mIsEmergency, mIsTestAccount);
+                if (isVideoCapable != mIsVideoCapable) {
+                    mIsVideoCapable = isVideoCapable;
+                    mAccount = registerPstnPhoneAccount(mIsEmergency, mIsTestAccount);
+                }
             }
         }
 
@@ -926,6 +985,24 @@ public class TelecomAccountRegistry {
         }
 
         /**
+         * Determines whether RTT downgrade is supported given the current state of the
+         * device.
+         */
+        private boolean isRttDowngradeSupported() {
+            /**
+             * We can return the current cached value for both sim and simless case
+             * when the device has sim, cached value will have the current value
+             * for simless case, it will have the previous sub's config value, but in simless only
+             * emergency call is supported, it's assumend this API will be called for emergency
+             * RTT only.
+             */
+            int simLessRttDowngradeSupported = Settings.Secure.getInt(
+                    mContext.getContentResolver(), RTT_DOWNGRADE_SUPPORTED +
+                    convertRttPhoneId(mPhone.getPhoneId()), RTT_DOWNGRADE_NOT_SUPPORTED);
+            return simLessRttDowngradeSupported != RTT_DOWNGRADE_NOT_SUPPORTED;
+        }
+
+        /**
          * Determines whether RTT is supported given the current state of the
          * device.
          */
@@ -949,8 +1026,9 @@ public class TelecomAccountRegistry {
 
                 String[] supportedCountries = mContext.getResources().getStringArray(
                         R.array.config_simless_emergency_rtt_supported_countries);
-                if (supportedCountries == null || Arrays.stream(supportedCountries).noneMatch(
-                        Predicate.isEqual(country))) {
+                if ((supportedCountries == null || Arrays.stream(supportedCountries).noneMatch(
+                        Predicate.isEqual(country))) || !(QtiImsUtils.isSimLessRttSupported(
+                        mPhone.getPhoneId(), mPhone.getContext()) && isUserRttSettingOn())) {
                     Log.i(this, "isRttCurrentlySupported -- emergency acct and"
                             + " not supported in this country: " + country);
                     return false;
@@ -963,10 +1041,13 @@ public class TelecomAccountRegistry {
 
             boolean isRttSupported = PhoneGlobals.getInstance().phoneMgr
                     .isRttEnabled(mPhone.getSubId());
+            boolean isUserRttSettingOn = isUserRttSettingOn();
 
             boolean isRoaming = mTelephonyManager.isNetworkRoaming(mPhone.getSubId());
             boolean isOnWfc = mPhone.getImsRegistrationTech()
-                    == ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN;
+                    == ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN
+                    ||  mPhone.getImsRegistrationTech()
+                    == ImsRegistrationImplBase.REGISTRATION_TECH_CROSS_SIM;
             boolean alwaysAllowWhileRoaming = isCarrierAllowRttWhenRoaming();
 
             boolean shouldDisableBecauseRoamingOffWfc =
@@ -975,11 +1056,21 @@ public class TelecomAccountRegistry {
             Log.i(this, "isRttCurrentlySupported -- regular acct,"
                     + " hasVoiceAvailability: " + hasVoiceAvailability + "\n"
                     + " isRttSupported: " + isRttSupported + "\n"
+                    + " isUserRttSettingOn: " + isUserRttSettingOn + "\n"
                     + " alwaysAllowWhileRoaming: " + alwaysAllowWhileRoaming + "\n"
                     + " isRoaming: " + isRoaming + "\n"
                     + " isOnWfc: " + isOnWfc + "\n");
 
-            return hasVoiceAvailability && isRttSupported && !shouldDisableBecauseRoamingOffWfc;
+            return hasVoiceAvailability && isRttSupported && !shouldDisableBecauseRoamingOffWfc
+                    && isUserRttSettingOn;
+        }
+
+        private boolean isUserRttSettingOn() {
+            int rttSetting = Settings.Secure.getInt(
+                    mContext.getContentResolver(),
+                    Settings.Secure.RTT_CALLING_MODE
+                    + convertRttPhoneId(mPhone.getPhoneId()) , 0);
+            return rttSetting != 0;
         }
 
         /**
@@ -1073,6 +1164,10 @@ public class TelecomAccountRegistry {
                             ImsRegistrationImplBase.REGISTRATION_TECH_CROSS_SIM,
                     MmTelFeature.MmTelCapabilities.CAPABILITY_TYPE_VOICE);
         }
+
+        private boolean isSubAccount() {
+            return !(mIsTestAccount || mIsEmergency);
+        }
     }
 
     private OnSubscriptionsChangedListener mOnSubscriptionsChangedListener =
@@ -1085,10 +1180,40 @@ public class TelecomAccountRegistry {
             }
             mSubscriptionListenerState = LISTENER_STATE_REGISTERED;
 
-            // Any time the SubscriptionInfo changes rerun the setup
-            Log.i(this, "TelecomAccountRegistry: onSubscriptionsChanged - update accounts");
-            tearDownAccounts();
-            setupAccounts();
+            List<SubscriptionInfo> subList =
+                    mSubscriptionManager.getActiveSubscriptionInfoList();
+
+            boolean isTearingDownNeeded = subList == null;
+
+            isTearingDownNeeded |= hasAnyUserHandleChanged();
+
+            if (!isTearingDownNeeded) {
+                int subAccountCnt = subList.size();
+                synchronized (mAccountsLock) {
+                    subAccountCnt = mAccounts.stream()
+                            .filter(entry -> entry.isSubAccount())
+                            .collect(java.util.stream.Collectors.toList()).size();
+                }
+                isTearingDownNeeded |= subAccountCnt != subList.size();
+                if (!isTearingDownNeeded) {
+                    // Check if it is needed to be torn down for SUB refresh.
+                    for (SubscriptionInfo subInfo : subList) {
+                        isTearingDownNeeded |= !isAccountMatched(subInfo);
+                    }
+                }
+            }
+            if (isTearingDownNeeded) {
+                Log.i(this, "TelecomAccountRegistry: onSubscriptionsChanged - update accounts");
+                tearDownAccounts();
+                setupAccounts();
+            } else {
+                Log.i(this, "TelecomAccountRegistry: onSubscriptionsChanged - reregister accounts");
+                synchronized (mAccountsLock) {
+                    for (AccountEntry entry : mAccounts) {
+                        entry.reRegisterPstnPhoneAccount();
+                    }
+                }
+            }
         }
 
         @Override
@@ -1127,7 +1252,8 @@ public class TelecomAccountRegistry {
                 tearDownAccounts();
                 setupAccounts();
             } else if (CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED.equals(
-                    intent.getAction())) {
+                    intent.getAction()) || CarrierConfigManager.ACTION_ESSENTIAL_RECORDS_LOADED.
+                    equals(intent.getAction())) {
                 Log.i(this, "Carrier-config changed, checking for phone account updates.");
                 int subId = intent.getIntExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX,
                         SubscriptionManager.INVALID_SUBSCRIPTION_ID);
@@ -1211,6 +1337,27 @@ public class TelecomAccountRegistry {
         }
     };
 
+    private int mSimCount;
+    private PstnIncomingCallNotifier[] mPstnIncomingCallNotifiers;
+    private static final int EVENT_MSIM_CONFIGURATION_CHANGED = 1000;
+
+    private final class EventHandler extends Handler {
+        EventHandler(Looper looper) {
+            super(looper);
+        }
+
+        @Override
+        public void handleMessage(Message msg) {
+            switch(msg.what) {
+                case EVENT_MSIM_CONFIGURATION_CHANGED:
+                    handleMultiSimConfigChanged();
+                    break;
+                 default:
+                    break;
+            }
+        }
+    }
+
     TelecomAccountRegistry(Context context) {
         mContext = context;
         mTelecomManager = context.getSystemService(TelecomManager.class);
@@ -1218,7 +1365,7 @@ public class TelecomAccountRegistry {
         mTelephonyManager = TelephonyManager.from(context);
         mSubscriptionManager = SubscriptionManager.from(context);
         mHandlerThread.start();
-        mHandler = new Handler(Looper.getMainLooper());
+        mHandler = new EventHandler(Looper.getMainLooper());
         mRegisterSubscriptionListenerBackoff = new ExponentialBackoff(
                 REGISTER_START_DELAY_MS,
                 REGISTER_MAXIMUM_DELAY_MS,
@@ -1380,6 +1527,13 @@ public class TelecomAccountRegistry {
     }
 
     /**
+     * @return List of active subscription list.
+     */
+    public List<SubscriptionInfo> getActiveSubscriptionInfoList() {
+        return mSubscriptionManager.getActiveSubscriptionInfoList();
+    }
+
+    /**
      * Returns the address (e.g. the phone number) associated with a subscription.
      *
      * @param handle The phone account handle to find the subscription address for.
@@ -1396,18 +1550,46 @@ public class TelecomAccountRegistry {
         return null;
     }
 
+    /**
+     * Updates the adhoc conference capability for all phone accounts
+     */
     public void refreshAdhocConference(boolean isEnableAdhocConf) {
         synchronized (mAccountsLock) {
             Log.v(this, "refreshAdhocConference isEnable = " + isEnableAdhocConf);
             for (AccountEntry entry : mAccounts) {
-                boolean hasAdhocConfCapability = entry.mAccount.hasCapabilities(
-                        PhoneAccount.CAPABILITY_ADHOC_CONFERENCE_CALLING);
-                if (!isEnableAdhocConf && hasAdhocConfCapability) {
-                    entry.updateAdhocConfCapability(isEnableAdhocConf);
-                } else if (isEnableAdhocConf && !hasAdhocConfCapability) {
-                    entry.updateAdhocConfCapability(entry.mPhone.isImsRegistered());
+                refreshAdhocConferenceForAccountEntry(isEnableAdhocConf, entry);
+            }
+        }
+    }
+
+    /**
+     * Updates the adhoc conference capability per phone account.
+     */
+    public void refreshAdhocConferenceForAccount(boolean isEnableAdhocConf,
+            PhoneAccountHandle handle) {
+        synchronized (mAccountsLock) {
+            Log.v(this, "refreshAdhocConference isEnable = " + isEnableAdhocConf +
+                    " PhoneAccountHandle = " + handle);
+            for (AccountEntry entry : mAccounts) {
+                if (entry.getPhoneAccountHandle().equals(handle)) {
+                    refreshAdhocConferenceForAccountEntry(isEnableAdhocConf, entry);
+                    break;
                 }
             }
+        }
+    }
+
+    /**
+     * Updates the adhoc conference capability per Account entry.
+     */
+    private void refreshAdhocConferenceForAccountEntry(boolean isEnableAdhocConf,
+            AccountEntry entry) {
+        boolean hasAdhocConfCapability = entry.mAccount.hasCapabilities(
+                PhoneAccount.CAPABILITY_ADHOC_CONFERENCE_CALLING);
+        if (!isEnableAdhocConf && hasAdhocConfCapability) {
+            entry.updateAdhocConfCapability(isEnableAdhocConf);
+        } else if (isEnableAdhocConf && !hasAdhocConfCapability) {
+            entry.updateAdhocConfCapability(entry.mPhone.isImsRegistered());
         }
     }
 
@@ -1455,6 +1637,7 @@ public class TelecomAccountRegistry {
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_USER_SWITCHED);
         filter.addAction(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED);
+        filter.addAction(CarrierConfigManager.ACTION_ESSENTIAL_RECORDS_LOADED);
         mContext.registerReceiver(mReceiver, filter);
 
         //We also need to listen for locale changes
@@ -1464,6 +1647,39 @@ public class TelecomAccountRegistry {
         mContext.registerReceiver(mLocaleChangeReceiver, localeChangeFilter);
 
         registerContentObservers();
+
+        mSimCount = mTelephonyManager.getActiveModemCount();
+        mPstnIncomingCallNotifiers =
+                new PstnIncomingCallNotifier[mSimCount];
+        // register for Pstn incoming call notifiers
+        for (int i = 0; i < mSimCount; i++) {
+            mPstnIncomingCallNotifiers[i] = new PstnIncomingCallNotifier(PhoneFactory.getPhone(i));
+        }
+        PhoneConfigurationManager.registerForMultiSimConfigChange(mHandler,
+                EVENT_MSIM_CONFIGURATION_CHANGED, null);
+
+    }
+
+    private void handleMultiSimConfigChanged() {
+        int newSimCount = mTelephonyManager.getActiveModemCount();
+        Log.i(this, "handleMultiSimConfigChanged: newSimCount: " + newSimCount
+                + " mSimCount: " + mSimCount);
+        if (newSimCount > mSimCount) {
+            mPstnIncomingCallNotifiers = Arrays.copyOf(mPstnIncomingCallNotifiers, newSimCount);
+            for (int i = mSimCount; i < newSimCount; i++) {
+                mPstnIncomingCallNotifiers[i] = new PstnIncomingCallNotifier(
+                        PhoneFactory.getPhone(i));
+            }
+        } else if (newSimCount < mSimCount) {
+            // for DSDS->SS transition, keep the array size same and just teardown
+            // the notifier objects.
+            for (int i = newSimCount; i < mSimCount; i++) {
+                if (mPstnIncomingCallNotifiers[i] == null) continue;
+                mPstnIncomingCallNotifiers[i].teardown();
+                mPstnIncomingCallNotifiers[i] = null;
+            }
+        }
+        mSimCount = newSimCount;
     }
 
     private void registerContentObservers() {
@@ -1479,9 +1695,13 @@ public class TelecomAccountRegistry {
             }
         };
 
-        Uri rttSettingUri = Settings.Secure.getUriFor(Settings.Secure.RTT_CALLING_MODE);
-        mContext.getContentResolver().registerContentObserver(
-                rttSettingUri, false, rttUiSettingObserver);
+        // register for all settings
+        for (int i = 0; i < mTelephonyManager.getPhoneCount(); i++) {
+            Uri rttSettingUri = Settings.Secure.getUriFor(
+                    Settings.Secure.RTT_CALLING_MODE + convertRttPhoneId(i));
+            mContext.getContentResolver().registerContentObserver(
+                    rttSettingUri, false, rttUiSettingObserver);
+        }
 
         // Listen to the changes to the user's Contacts Discovery Setting.
         ContentObserver contactDiscoveryObserver = new ContentObserver(mHandler) {
@@ -1498,6 +1718,10 @@ public class TelecomAccountRegistry {
                 Telephony.SimInfo.COLUMN_IMS_RCS_UCE_ENABLED);
         mContext.getContentResolver().registerContentObserver(
                 contactDiscUri, true /*notifyForDescendants*/, contactDiscoveryObserver);
+    }
+
+    private static String convertRttPhoneId(int phoneId) {
+        return phoneId != 0 ? Integer.toString(phoneId) : "";
     }
 
     /**
@@ -1561,17 +1785,36 @@ public class TelecomAccountRegistry {
 
         final boolean phoneAccountsEnabled = mContext.getResources().getBoolean(
                 R.bool.config_pstn_phone_accounts_enabled);
+        int activeCount = 0;
+        int activeSubscriptionId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
         synchronized (mAccountsLock) {
             try {
                 if (phoneAccountsEnabled) {
+
                     for (Phone phone : phones) {
                         int subscriptionId = phone.getSubId();
-                        Log.i(this, "setupAccounts: Phone with subscription id %d", subscriptionId);
+                        int slotId = phone.getPhoneId();
+                        boolean isAccountAdded = false;
+
+                        Log.i(this, "setupAccounts: Phone with subscription id: " + subscriptionId +
+                                " slotId: " + slotId);
                         // setupAccounts can be called multiple times during service changes.
                         // Don't add an account if subscription is not ready.
                         if (!SubscriptionManager.isValidSubscriptionId(subscriptionId)) {
                             Log.d(this, "setupAccounts: skipping invalid subid %d", subscriptionId);
+                            // If device configured in dsds mode, a SIM removed and if corresponding
+                            // phone is in ECM or SCBM then add emergency account to that sub so
+                            // that incoming emergency call can be processed.
+                            Phone emergencyPhone =
+                                    PhoneGlobals.getInstance().getPhoneInEmergencyMode();
+                            if ((mTelephonyManager.getPhoneCount() > 1)
+                                    && (emergencyPhone != null)
+                                    && emergencyPhone.getPhoneId() == phone.getPhoneId()) {
+                                mAccounts.add(new AccountEntry(emergencyPhone, true /* emergency */,
+                                        false /* isTest */));
+                                isAccountAdded = true;
+                            }
                             continue;
                         }
                         // Don't add account if it's opportunistic subscription, which is considered
@@ -1584,8 +1827,26 @@ public class TelecomAccountRegistry {
                             continue;
                         }
 
-                        mAccounts.add(new AccountEntry(phone, false /* emergency */,
-                                false /* isTest */));
+                        if (mSubscriptionManager.isActiveSubId(subscriptionId)) {
+                            activeCount++;
+                            activeSubscriptionId = subscriptionId;
+                            mAccounts.add(new AccountEntry(phone, false /* emergency */,
+                                    false /* isTest */));
+                            isAccountAdded = true;
+                        }
+                        // Speacial case where one sub sim locked other sub reporting emergency service
+                        // emergency call placed will initiate on primary sub i.e sub which is reporting
+                        // limited/emergency service, if phone switches when emergency call is
+                        // in progress, there will missing phone account which can notify phantom call
+                        // to upper layer add emergency if for a phone no account added and if phone
+                        // reporting emergency service and other subs oos or if phone has running call
+                        if (!isAccountAdded && ((phone.getServiceState().isEmergencyOnly()
+                                    && !isOtherPhoneInService(phone))
+                                    || (phone.getState() == PhoneConstants.State.OFFHOOK))) {
+                            Log.i(this, "Adding emergency account to phone id: "+phone.getPhoneId());
+                            mAccounts.add(new AccountEntry(phone, true /* emergency */,
+                                    false /* isTest */));
+                        }
                     }
                 }
             } finally {
@@ -1594,9 +1855,9 @@ public class TelecomAccountRegistry {
                 // numbers but a phone account is.
                 if (mAccounts.isEmpty()) {
                     Log.i(this, "setupAccounts: adding default");
-                    mAccounts.add(
-                            new AccountEntry(PhoneFactory.getDefaultPhone(), true /* emergency */,
-                                    false /* isTest */));
+                    mAccounts.add(new AccountEntry(PhoneFactory.getPhone(
+                            PhoneUtils.getPrimaryStackPhoneId()), true /* emergency */,
+                            false /* isTest */));
                 }
             }
 
@@ -1610,6 +1871,114 @@ public class TelecomAccountRegistry {
 
         // Clean up any PhoneAccounts that are no longer relevant
         cleanupPhoneAccounts();
+
+        // Do not call setUserSelectedOutgoingPhoneAccount() from here when IRadio HAL version 1_5
+        // and later enabled as  MultiSimSettingController.updateUserPreferences() taking care of
+        // settings the default outgoing phone account.
+        if ((phones.length > 0) && phones[0].getHalVersion().less(RIL.RADIO_HAL_VERSION_1_5)) {
+            PhoneAccountHandle defaultPhoneAccount =
+                    mTelecomManager.getUserSelectedOutgoingPhoneAccount();
+
+            if ((defaultPhoneAccount == null)
+                        && (mTelephonyManager.getActiveModemCount() > Count.ONE.ordinal())
+                        && (activeCount == Count.ONE.ordinal())
+                        && (areAllSimAccountsFound()) && (isRadioInValidState(phones))
+                        && !isSubIdCreationPending()) {
+                PhoneAccountHandle phoneAccountHandle =
+                        subscriptionIdToPhoneAccountHandle(activeSubscriptionId);
+                if (phoneAccountHandle != null) {
+                    Log.i(this, "setting default phone account, subId " + activeSubscriptionId);
+                    mTelecomManager.setUserSelectedOutgoingPhoneAccount(phoneAccountHandle);
+                }
+            }
+        }
+    }
+
+    // FIXME
+    private boolean isSubIdCreationPending() {
+        Log.i(this, "isSubIdCreationPending");
+
+        if (SubscriptionManagerService.getInstance() == null) {
+            Log.i(this, "isSubIdCreationPending: SMVC instance is null");
+            return false;
+        }
+        return SubscriptionManagerService.getInstance().isSubIdCreationPending();
+    }
+
+    private boolean areAllSimAccountsFound() {
+        final Iterator<PhoneAccountHandle> phoneAccounts =
+                mTelecomManager.getCallCapablePhoneAccounts().listIterator();
+        while (phoneAccounts.hasNext()) {
+            final PhoneAccountHandle phoneAccountHandle = phoneAccounts.next();
+            final PhoneAccount phoneAccount = mTelecomManager.getPhoneAccount(phoneAccountHandle);
+            if (mTelephonyManager.getSubIdForPhoneAccount(phoneAccount) ==
+                    SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isRadioInValidState(Phone[] phones) {
+        boolean isApmSimNotPwrDown = false;
+        try {
+            int propVal = PhoneUtils.getExtTelManager().
+                    getPropertyValueInt(APM_SIM_NOT_PWDN_PROPERTY, 0);
+            isApmSimNotPwrDown = (propVal == 1);
+            Log.d(this, "isRadioInValidState, propVal = " + propVal +
+                    " isApmSimNotPwrDown = " + isApmSimNotPwrDown);
+        } catch (NullPointerException ex) {
+            Log.w(this, "Failed to get property: + " + APM_SIM_NOT_PWDN_PROPERTY +
+                    " , Exception: " + ex);
+        }
+
+        int isAPMOn = Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.AIRPLANE_MODE_ON, 0);
+
+        // Do not update default Voice subId when SIM is pwdn due to APM
+        if ((isAPMOn == 1) && (!isApmSimNotPwrDown)) {
+            Log.d(this, "isRadioInValidState, isApmSimNotPwrDown = " + isApmSimNotPwrDown
+                    + ", isAPMOn:" + isAPMOn);
+            return false;
+        }
+
+        //Do not update default Voice subId when when device Shutdown is in progress
+        int  numPhones = mTelephonyManager.getActiveModemCount();
+        for (int i = 0; i < numPhones; i++) {
+            if (phones[i] != null && phones[i].isShuttingDown()) {
+                Log.d(this, " isRadioInValidState: device shutdown in progress ");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private PhoneAccountHandle subscriptionIdToPhoneAccountHandle(final int subId) {
+        final Iterator<PhoneAccountHandle> phoneAccounts =
+                mTelecomManager.getCallCapablePhoneAccounts().listIterator();
+        while (phoneAccounts.hasNext()) {
+            final PhoneAccountHandle phoneAccountHandle = phoneAccounts.next();
+            final PhoneAccount phoneAccount = mTelecomManager.getPhoneAccount(phoneAccountHandle);
+            if (subId == mTelephonyManager.getSubIdForPhoneAccount(phoneAccount)) {
+                return phoneAccountHandle;
+            }
+        }
+        return null;
+    }
+
+    private boolean isOtherPhoneInService(Phone currentPhone) {
+        TelephonyManager tm = TelephonyManager.getDefault();
+        int phoneCount = tm.getPhoneCount();
+        for (int phId = 0; phId < phoneCount; phId++) {
+            Phone phone = PhoneFactory.getPhone(phId);
+            if (currentPhone.getPhoneId() == phone.getPhoneId()) continue;
+            int ss = phone.getServiceState().getState();
+            Log.i(this, "Phone Id: %d Service State: %d",phone.getPhoneId(), ss);
+            if (ss == ServiceState.STATE_IN_SERVICE) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void tearDownAccounts() {
@@ -1622,6 +1991,29 @@ public class TelecomAccountRegistry {
         // Invalidate the TelephonyManager cache which maps phone account handles to sub ids since
         // all the phone account handles are being recreated at this point.
         PropertyInvalidatedCache.invalidateCache(TelephonyManager.CACHE_KEY_PHONE_ACCOUNT_TO_SUBID);
+    }
+
+    private boolean hasAnyUserHandleChanged() {
+        synchronized (mAccountsLock) {
+            for (AccountEntry entry : mAccounts) {
+                if (!entry.isSameUserHandle()) {
+                    Log.i(this, "hasAnyUserHandleChanged: changed");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isAccountMatched(SubscriptionInfo info) {
+        synchronized (mAccountsLock) {
+            for (AccountEntry entry : mAccounts) {
+                if (entry.isSameSubId(info)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

@@ -14,6 +14,40 @@
  * limitations under the License.
  */
 
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted (subject to the limitations in the
+ * disclaimer below) provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/or other materials provided
+ *     with the distribution.
+ *
+ *   * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its
+ *     contributors may be used to endorse or promote products derived
+ *     from this software without specific prior written permission.
+ *
+ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE
+ * GRANTED BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
+ * HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+ * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+ * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 package com.android.phone.settings;
 
 import static android.net.ConnectivityManager.NetworkCallback;
@@ -21,9 +55,11 @@ import static android.net.ConnectivityManager.NetworkCallback;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import android.content.ComponentName;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ComponentInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -41,6 +77,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerExecutor;
+import android.os.HandlerThread;
 import android.os.Message;
 import android.os.PersistableBundle;
 import android.os.SystemProperties;
@@ -66,6 +103,7 @@ import android.telephony.DataSpecificRegistrationInfo;
 import android.telephony.NetworkRegistrationInfo;
 import android.telephony.PhysicalChannelConfig;
 import android.telephony.RadioAccessFamily;
+import android.telephony.Rlog;
 import android.telephony.ServiceState;
 import android.telephony.SignalStrength;
 import android.telephony.SubscriptionManager;
@@ -109,6 +147,7 @@ import com.android.phone.R;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -116,6 +155,10 @@ import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+
+import com.qti.extphone.ExtTelephonyManager;
+import com.qti.extphone.QtiImeiInfo;
+import com.qti.extphone.ServiceCallback;
 
 /**
  * Radio Information Class
@@ -171,6 +214,8 @@ public class RadioInfo extends AppCompatActivity {
     private static final int sCellInfoListRateDisabled = Integer.MAX_VALUE;
     private static final int sCellInfoListRateMax = 0;
 
+    private ExtTelephonyManager mExtTelephonyManager = null;
+
     private static final String OEM_RADIO_INFO_INTENT =
             "com.android.phone.settings.OEM_RADIO_INFO";
 
@@ -202,6 +247,10 @@ public class RadioInfo extends AppCompatActivity {
 
     private static void log(String s) {
         Log.d(TAG, s);
+    }
+
+    private static void loge(String s) {
+        Log.e(TAG, s);
     }
 
     private static final int EVENT_QUERY_SMSC_DONE = 1005;
@@ -300,6 +349,7 @@ public class RadioInfo extends AppCompatActivity {
     private int mPreferredNetworkTypeResult;
     private int mCellInfoRefreshRateIndex;
     private int mSelectedPhoneIndex;
+    private boolean isExtServiceConnected = false;
 
     private final NetworkRequest mDefaultNetworkRequest = new NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
@@ -311,6 +361,31 @@ public class RadioInfo extends AppCompatActivity {
             int dlbw = nc.getLinkDownstreamBandwidthKbps();
             int ulbw = nc.getLinkUpstreamBandwidthKbps();
             updateBandwidths(dlbw, ulbw);
+        }
+    };
+
+    private static final String ACTION_RADIO_POWER_STATE_CHANGED =
+            "org.codeaurora.intent.action.RADIO_POWER_STATE";
+    private static final String RADIO_POWER_STATE = "state";
+    private static final int MAX_NUM_PHONES = 2;
+    private final HashMap<Integer, Boolean> mRadioStatusMap = new HashMap<>(MAX_NUM_PHONES);
+    private final HandlerThread mBroadcastReceiverThread =
+            new HandlerThread(TAG + "BroadcastReceiverThread");
+
+    private BroadcastReceiver mBroadcastReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            switch (intent.getAction()) {
+                case ACTION_RADIO_POWER_STATE_CHANGED:
+                    int slotId = intent.getIntExtra(SubscriptionManager.EXTRA_SLOT_INDEX,
+                            SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+                    int radioState = intent.getIntExtra(RADIO_POWER_STATE,
+                            TelephonyManager.RADIO_POWER_UNAVAILABLE);
+                    runOnUiThread(() -> handleRadioPowerStateChanged(slotId, radioState));
+                    break;
+                default:
+                    loge("onReceive: Unsupported action");
+            }
         }
     };
 
@@ -493,6 +568,11 @@ public class RadioInfo extends AppCompatActivity {
         mTelephonyManager = ((TelephonyManager) getSystemService(TELEPHONY_SERVICE))
                 .createForSubscriptionId(mPhone.getSubId());
 
+        mBroadcastReceiverThread.start();
+        Handler scheduler = new Handler(mBroadcastReceiverThread.getLooper());
+        IntentFilter filter = new IntentFilter(ACTION_RADIO_POWER_STATE_CHANGED);
+        mPhone.getContext().registerReceiver(mBroadcastReceiver, filter, null, scheduler);
+
         mImsManager = new ImsManager(mPhone.getContext());
         try {
             mProvisioningManager = ProvisioningManager.createForSubscriptionId(mPhone.getSubId());
@@ -590,6 +670,7 @@ public class RadioInfo extends AppCompatActivity {
                     showDsdsChangeDialog();
                 } else {
                     performDsdsSwitch();
+                    mDsdsSwitch.setEnabled(false);
                 }
             });
             mDsdsSwitch.setChecked(isDsdsEnabled());
@@ -659,6 +740,11 @@ public class RadioInfo extends AppCompatActivity {
         }).start();
 
         restoreFromBundle(icicle);
+
+        mExtTelephonyManager = ExtTelephonyManager.getInstance(this);
+        mExtTelephonyManager.connectService(mServiceCallback);
+        Log.d(TAG, "Connect to ExtTelephony bound service...");
+
     }
 
     @Override
@@ -678,6 +764,56 @@ public class RadioInfo extends AppCompatActivity {
         log("Started onResume");
 
         updateAllFields();
+        updateImei();
+    }
+
+    private ServiceCallback mServiceCallback = new ServiceCallback() {
+
+        @Override
+        public void onConnected() {
+          Log.d(TAG, "ExtTelephony Service connected");
+          isExtServiceConnected = true;
+          //get imei
+          updateImei();
+        }
+
+        @Override
+        public void onDisconnected() {
+            Log.d(TAG, "ExtTelephony Service disconnected...");
+            isExtServiceConnected = false;
+        }
+    };
+
+    private void updateImei() {
+        int slotId = SubscriptionManager.getPhoneId(mPhone.getSubId());
+        String imei = null;
+
+        if (isExtServiceConnected) {
+            QtiImeiInfo[] qtiImeiInfo = mExtTelephonyManager.getImeiInfo();
+
+            if (qtiImeiInfo != null) {
+                for (int i = 0; i < qtiImeiInfo.length; i++) {
+                  if (null != qtiImeiInfo[i] &&
+                          qtiImeiInfo[i].getSlotId() == slotId) {
+                      imei = qtiImeiInfo[i].getImei();
+                      Rlog.pii(TAG, "getImei: " + imei + " on slot" + slotId);
+                  }
+                }
+            }
+        }
+
+        if (TextUtils.isEmpty(imei)){
+            if (mPhone != null) {
+                imei = mPhone.getImei();
+                Rlog.pii(TAG, "phone getImei on slot " + slotId + ": " + imei);
+            }
+        }
+
+        if (TextUtils.isEmpty(imei)) {
+            mDeviceId.setText(R.string.radioInfo_unknown);
+        } else {
+            mDeviceId.setText(imei);
+        }
     }
 
     private void updateAllFields() {
@@ -753,7 +889,6 @@ public class RadioInfo extends AppCompatActivity {
         mTelephonyManager.unregisterTelephonyCallback(mTelephonyCallback);
         mTelephonyManager.setCellInfoListRate(sCellInfoListRateDisabled, mPhone.getSubId());
         mConnectivityManager.unregisterNetworkCallback(mNetworkCallback);
-
     }
 
     private void restoreFromBundle(Bundle b) {
@@ -836,6 +971,11 @@ public class RadioInfo extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         mQueuedWork.shutdown();
+        if (mExtTelephonyManager != null && mServiceCallback != null) {
+            mExtTelephonyManager.disconnectService(mServiceCallback);
+        }
+        mPhone.getContext().unregisterReceiver(mBroadcastReceiver);
+        mBroadcastReceiverThread.quitSafely();
     }
 
     // returns array of string labels for each phone index. The array index is equal to the phone
@@ -1275,14 +1415,6 @@ public class RadioInfo extends AppCompatActivity {
     private void updateProperties() {
         String s;
         Resources r = getResources();
-
-        s = mPhone.getDeviceId();
-        if (s == null) {
-            s = r.getString(R.string.radioInfo_unknown);
-        }  else if (mPhone.getImeiType() == ImeiInfo.ImeiType.PRIMARY) {
-            s = s + " (" + r.getString(R.string.radioInfo_imei_primary) + ")";
-        }
-        mDeviceId.setText(s);
 
         s = mPhone.getSubscriberId();
         if (s == null) s = r.getString(R.string.radioInfo_unknown);
@@ -1930,7 +2062,9 @@ public class RadioInfo extends AppCompatActivity {
                 }
                 // getSubId says it takes a slotIndex, but it actually takes a phone index
                 mSelectedPhoneIndex = phoneIndex;
+
                 updatePhoneIndex(phoneIndex, SubscriptionManager.getSubscriptionId(phoneIndex));
+                updateImei();
             }
         }
 
@@ -2101,5 +2235,24 @@ public class RadioInfo extends AppCompatActivity {
         }
 
         return phone;
+    }
+
+    private void handleRadioPowerStateChanged(int slotId, int radioState) {
+        mRadioStatusMap.put(slotId, radioState != TelephonyManager.RADIO_POWER_UNAVAILABLE);
+        int numRadiosAvailable = 0;
+        for (boolean radioStatus : mRadioStatusMap.values()) {
+            if (radioStatus) {
+                numRadiosAvailable++;
+            }
+        }
+        log("handleRadioPowerStateChanged: numRadiosAvailable = " + numRadiosAvailable +
+                ", slotId = " + slotId + ", radioState = " + radioState);
+        boolean dsdsSwitchEnableCondition = (!mDsdsSwitch.isChecked() && numRadiosAvailable >= 1) ||
+            (mDsdsSwitch.isChecked() && numRadiosAvailable == MAX_NUM_PHONES);
+        if (mDsdsSwitch != null) {
+            mDsdsSwitch.setEnabled(dsdsSwitchEnableCondition);
+        } else {
+            log("handleRadioPowerStateChanged: mDsdsSwitch null");
+        }
     }
 }

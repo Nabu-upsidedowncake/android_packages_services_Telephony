@@ -26,6 +26,7 @@ import android.telecom.ConnectionService;
 import android.telecom.DisconnectCause;
 import android.telecom.PhoneAccountHandle;
 import android.telephony.CarrierConfigManager;
+import android.telephony.TelephonyManager;
 
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
@@ -68,7 +69,12 @@ public class ImsConferenceController {
             if (conference instanceof ImsConference) {
                 // Ims Conference call ended, so UE may now have the ability to initiate
                 // an Adhoc Conference call. Hence, try enabling adhoc conference capability
-                mTelecomAccountRegistry.refreshAdhocConference(true);
+                if(isDsdaOrDsdsTransitionMode((ImsConference)conference)){
+                    mTelecomAccountRegistry.refreshAdhocConferenceForAccount(true,
+                            conference.getPhoneAccountHandle());
+                } else {
+                     mTelecomAccountRegistry.refreshAdhocConference(true);
+                }
             }
             mImsConferences.remove(conference);
         }
@@ -251,7 +257,7 @@ public class ImsConferenceController {
      * Calculates the conference-capable state of all GSM connections in this connection service.
      * Connections from different {@link PhoneAccountHandle}s shall not be conferenceable.
      */
-    private void recalculateConferenceable() {
+    void recalculateConferenceable() {
         Log.v(this, "recalculateConferenceable : %d", mTelephonyConnections.size());
         HashSet<Conferenceable> conferenceableSet = new HashSet<>(mTelephonyConnections.size() +
                 mImsConferences.size());
@@ -298,7 +304,8 @@ public class ImsConferenceController {
                 Log.d(this, "recalc - %s %s", conference.getState(), conference);
             }
 
-            if (!conference.isConferenceHost()) {
+            if (!conference.isConferenceHost() &&
+                    (!conference.isMultiAnchorConferenceSupported())) {
                 if (Log.VERBOSE) {
                     Log.v(this, "skipping conference (not hosted on this device): %s", conference);
                 }
@@ -308,8 +315,12 @@ public class ImsConferenceController {
             // Since UE cannot host two conference calls, remove the ability to initiate
             // another conference call as there already exists a conference call, which
             // is hosted on this device.
-            mTelecomAccountRegistry.refreshAdhocConference(false);
-
+            if(isDsdaOrDsdsTransitionMode(conference)){
+                mTelecomAccountRegistry.refreshAdhocConferenceForAccount(false,
+                        conference.getPhoneAccountHandle());
+            } else {
+                mTelecomAccountRegistry.refreshAdhocConference(false);
+            }
             switch (conference.getState()) {
                 case Connection.STATE_ACTIVE:
                     //fall through
@@ -351,6 +362,7 @@ public class ImsConferenceController {
 
                 ((Connection) c).setConferenceables(conferenceables);
             } else if (c instanceof ImsConference) {
+                PhoneAccountHandle handle = getPhoneAccountHandle(c);
                 ImsConference imsConference = (ImsConference) c;
 
                 // If the conference is full, don't allow anything to be conferenced with it.
@@ -362,14 +374,30 @@ public class ImsConferenceController {
                 // to another conference. Removes connections from different PhoneAccountHandles.
                 List<Connection> connections = conferenceableSet
                         .stream()
-                        .filter(conferenceable -> conferenceable instanceof Connection
-                                && isSamePhoneAccountHandle(c, conferenceable))
+                        .filter(conferenceable -> conferenceable instanceof Connection &&
+                        Objects.equals(handle, getPhoneAccountHandle(conferenceable)) &&
+                        isSamePhoneAccountHandle(c, conferenceable) &&
+                        !(isHeld(c) && isHeld(conferenceable)))
                         .map(conferenceable -> (Connection) conferenceable)
                         .collect(Collectors.toList());
                 // Conference equivalent to setConferenceables that only accepts Connections
                 imsConference.setConferenceableConnections(connections);
             }
         }
+    }
+
+    /*
+     * Checks if the Connection is in HELD state
+     */
+    private static boolean isHeld(Conferenceable conn) {
+        return conn instanceof Connection ?
+                isHoldingState(((Connection) conn).getState()) :
+                conn instanceof ImsConference ?
+                isHoldingState(((ImsConference) conn).getState()) : false;
+    }
+
+    private static boolean isHoldingState(int state) {
+        return state == Connection.STATE_HOLDING;
     }
 
     /**
@@ -444,6 +472,8 @@ public class ImsConferenceController {
         conferenceHostConnection.setVideoPauseSupported(connection.getVideoPauseSupported());
         conferenceHostConnection.setManageImsConferenceCallSupported(
                 connection.isManageImsConferenceCallSupported());
+        conferenceHostConnection.setTelephonyConnectionService(
+                connection.getTelephonyConnectionService());
         // WARNING: do not try to copy the video provider from connection to
         // conferenceHostConnection here.  In connection.cloneConnection, part of the clone
         // process is to set the original connection so it's already set:
@@ -515,13 +545,26 @@ public class ImsConferenceController {
                     CarrierConfigManager.KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL);
             boolean shouldLocalDisconnectOnEmptyConference = bundle.getBoolean(
                     CarrierConfigManager.KEY_LOCAL_DISCONNECT_EMPTY_IMS_CONFERENCE_BOOL);
+            boolean isMultiAnchorConferenceSupported = bundle.getBoolean(
+                    CarrierConfigManager.KEY_CARRIER_SUPPORTS_MULTIANCHOR_CONFERENCE);
+            boolean filterOutConferenceHost = !cfgManager.getConfigForSubId(phone.getSubId())
+                    .getBoolean("disable_filter_out_conference_host");
 
             config.setIsMaximumConferenceSizeEnforced(isMaximumConferenceSizeEnforced)
                     .setMaximumConferenceSize(maximumConferenceSize)
                     .setIsHoldAllowed(isHoldAllowed)
                     .setShouldLocalDisconnectEmptyConference(
-                            shouldLocalDisconnectOnEmptyConference);
+                            shouldLocalDisconnectOnEmptyConference)
+                    .setIsMultiAnchorConferenceSupported(isMultiAnchorConferenceSupported)
+                    .setFilterOutConferenceHost(filterOutConferenceHost);
         }
         return config.build();
+    }
+
+    private boolean isDsdaOrDsdsTransitionMode(ImsConference conference) {
+        Connection connection = conference.getConferenceHost();
+        if (!(connection instanceof TelephonyConnection)) return false;
+        Context context = ((TelephonyConnection)connection).getPhone().getContext();
+        return TelephonyManager.from(context).isDsdaOrDsdsTransitionMode();
     }
 }

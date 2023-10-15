@@ -29,8 +29,12 @@ android_app {
         "libprotobuf-java-lite",
         "app-compat-annotations",
         "unsupportedappusage",
+        "telephony-ext",
+         "extphonelib",
+        "ims-ext-common",
         "org.apache.http.legacy",
     ],
+    enforce_uses_libs: false,
 
     static_libs: [
         "androidx.appcompat_appcompat",
